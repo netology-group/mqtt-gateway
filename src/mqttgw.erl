@@ -614,7 +614,16 @@ handle_publish_authz_broker_request_payload(
            correlation_data := CorrData,
            response_topic := RespTopic}} ->
                handle_publish_broker_dynsub_create_request(
-                   Version, Object, Subject, CorrData, RespTopic, BrokerId, AgentId, State);
+                   Version, Object, Subject, CorrData, RespTopic, BrokerId, AgentId, State, false);
+        {service,
+         #{<<"object">> := Object,
+           <<"subject">> := Subject},
+         #{type := <<"request">>,
+           method := <<"broadcast_subscription.create">>,
+           correlation_data := CorrData,
+           response_topic := RespTopic}} ->
+               handle_publish_broker_dynsub_create_request(
+                   Version, Object, Subject, CorrData, RespTopic, BrokerId, AgentId, State, true);
         {service,
          #{<<"object">> := Object,
            <<"subject">> := Subject},
@@ -623,7 +632,16 @@ handle_publish_authz_broker_request_payload(
            correlation_data := CorrData,
            response_topic := RespTopic}} ->
                handle_publish_broker_dynsub_delete_request(
-                   Version, Object, Subject, CorrData, RespTopic, BrokerId, AgentId, State);
+                   Version, Object, Subject, CorrData, RespTopic, BrokerId, AgentId, State, false);
+        {service,
+         #{<<"object">> := Object,
+           <<"subject">> := Subject},
+         #{type := <<"request">>,
+           method := <<"broadcast_subscription.delete">>,
+           correlation_data := CorrData,
+           response_topic := RespTopic}} ->
+               handle_publish_broker_dynsub_delete_request(
+                   Version, Object, Subject, CorrData, RespTopic, BrokerId, AgentId, State, true);
         _ ->
             error_logger:error_msg(
                 "Error on publish: unsupported broker request = ~p with properties = ~p "
@@ -642,10 +660,10 @@ handle_publish_authz_broker_request_payload(
 
 -spec handle_publish_broker_dynsub_create_request(
     binary(), mqttgw_dynsub:object(), mqttgw_dynsub:subject(),
-    binary(), binary(), mqttgw_id:agent_id(), mqttgw_id:agent_id(), state())
+    binary(), binary(), mqttgw_id:agent_id(), mqttgw_id:agent_id(), state(), boolean())
     -> ok | {error, error()}.
 handle_publish_broker_dynsub_create_request(
-    Version, Object, Subject, CorrData, RespTopic, BrokerId, AgentId, State) ->
+    Version, Object, Subject, CorrData, RespTopic, BrokerId, AgentId, State, IsBroadcast) ->
     #state{
         time=Time,
         unique_id=UniqueId,
@@ -655,16 +673,22 @@ handle_publish_broker_dynsub_create_request(
     %% Subscribe the agent to the app's topic and send a success response
     App = mqttgw_id:format_account_id(AgentId),
     Data = #{app => App, object => Object, version => Version},
+    {Topic, QoS} = case IsBroadcast of
+        false ->
+            mqttgw_dyn_srv:authz_subscription_topic(Data);
+        true ->
+            mqttgw_dyn_srv:authz_broadcast_subscription_topic(Data)
+    end,
     DynsubRespData = {CorrData, RespTopic, ?BROKER_CONNECTION,
                         BrokerId, UniqueId, SessionPairId, Time},
-    mqttgw_dyn_srv:create_dynsub(Subject, Data, DynsubRespData).
+    mqttgw_dyn_srv:create_dynsub(Subject, Topic, QoS, DynsubRespData).
 
 -spec handle_publish_broker_dynsub_delete_request(
     binary(), mqttgw_dynsub:object(), mqttgw_dynsub:subject(),
-    binary(), binary(), mqttgw_id:agent_id(), mqttgw_id:agent_id(), state())
+    binary(), binary(), mqttgw_id:agent_id(), mqttgw_id:agent_id(), state(), boolean())
     -> ok | {error, error()}.
 handle_publish_broker_dynsub_delete_request(
-    Version, Object, Subject, CorrData, RespTopic, BrokerId, AgentId, State) ->
+    Version, Object, Subject, CorrData, RespTopic, BrokerId, AgentId, State, IsBroadcast) ->
     #state{
         time=Time,
         unique_id=UniqueId,
@@ -674,9 +698,13 @@ handle_publish_broker_dynsub_delete_request(
     %% Unsubscribe the agent from the app's topic and send a success response
     App = mqttgw_id:format_account_id(AgentId),
     Data = #{app => App, object => Object, version => Version},
+    Topic = case IsBroadcast of
+        false -> mqttgw_dyn_srv:authz_subscription_topic(Data);
+        true -> mqttgw_dyn_srv:authz_broadcast_subscription_topic(Data)
+    end,
     DynsubRespData = {CorrData, RespTopic, ?BROKER_CONNECTION,
                         BrokerId, UniqueId, SessionPairId, Time},
-    mqttgw_dyn_srv:delete_dynsub(Subject, Data, DynsubRespData).
+    mqttgw_dyn_srv:delete_dynsub(Subject, Data, DynsubRespData, Topic).
 
 -spec handle_message_properties(message(), mqttgw_id:agent_id(), mqttgw_id:agent_id(), state())
     -> message().
@@ -983,6 +1011,21 @@ verify_publish_topic([<<"agents">>, Me, <<"api">>, _, <<"out">>, _], _AccountId,
 verify_publish_topic([<<"agents">>, _, <<"api">>, _, <<"in">>, Me], Me, _AgentId, Mode)
     when (Mode =:= service) or (Mode =:= observer) or (Mode =:= bridge)
     -> ok;
+%% Broadcast dynsub:
+%% -> event(agent-to-many): broadcasts/APP_ACCOUNT_ID/api/v1/BROADCAST_URI
+verify_publish_topic([<<"broadcasts">>, _AppAccountId, <<"api">>, _ | _] = Topic,
+    _AccountId, AgentId, Mode)
+    -> case vmq_subscriber_db:read({"", AgentId}) of
+        undefined -> error({no_agent_in_subscriber_db, Topic, AgentId, Mode});
+        NodeSubs when length(NodeSubs) > 1 ->
+            error({forbidden_multinode_sub, Topic, AgentId, Mode});
+        %% If agent is subscribed to this topic - let him publish
+        [{_Node, _, Subs}] ->
+            case lists:search(fun({T, _}) -> T == Topic end, Subs) of
+                false -> error({missing_broadcast_dynsub, Topic, AgentId, Mode});
+                {value, _} -> ok
+            end
+    end;
 %% Forbidding publishing to any other topics
 verify_publish_topic(Topic, _AccountId, AgentId, Mode)
     -> error({nomatch_publish_topic, Topic, AgentId, Mode}).
@@ -1564,10 +1607,12 @@ delete_client_dynsubs(Subject, BrokerConn, BrokerId, UniqueId, SessionPairId, Ti
     DynSubL = mqttgw_dynsub:list(Subject),
 
     %% Send a multicast event to the application
+    %% But only about apps/* subs
+    %% [<<>>] is used as default so hd() would not throw on empty lists
     [send_dynsub_multicast_event(
         <<"subscription.delete">>, Subject, Data, BrokerConn, BrokerId,
         UniqueId, SessionPairId, Time)
-     || Data <- DynSubL],
+     || Data <- DynSubL, hd(maps:get(topic, Data, [<<>>])) == <<"apps">>],
 
     %% Remove subscriptions
     [mqttgw_dyn_srv:delete_dynsub(Subject, Data) || Data  <- DynSubL],

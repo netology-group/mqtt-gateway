@@ -41,11 +41,19 @@ filter(L) ->
     lists:flatmap(fun({_, _, S}) ->
         lists:foldl(
             fun
-                ({[<<"apps">>, App, <<"api">>, Ver | Object], _Qos}, Acc) ->
+                ({[<<"apps">>, App, <<"api">>, Ver | Object] = Topic, _Qos}, Acc) ->
                     Data =
                         #{app => App,
                           object => Object,
-                          version => Ver},
+                          version => Ver,
+                          topic => Topic},
+                    [Data | Acc];
+                ({[<<"broadcasts">>, App, <<"api">>, Ver | Object] = Topic, _Qos}, Acc) ->
+                    Data =
+                        #{app => App,
+                          object => Object,
+                          version => Ver,
+                          topic => Topic},
                     [Data | Acc];
                 (_, Acc) ->
                     Acc
